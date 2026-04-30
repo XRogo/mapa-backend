@@ -6,12 +6,12 @@ require('dotenv').config();
 
 const app = express();
 
-console.log("--- BACKEND (SMART INTERNAL APPEND) ---");
+console.log("--- BACKEND (OVERWRITE/APPEND MODE) ---");
 
 const saveLimiter = rateLimit({
     windowMs: 2000,
     max: 1,
-    message: "Zwolnij! Możesz wysyłać zmiany co 2 sekundy.",
+    message: "Zwolnij!",
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -27,22 +27,20 @@ app.get('/status', (req, res) => {
 });
 
 app.post('/save', saveLimiter, async (req, res) => {
-    const { password, content, authors } = req.body;
+    const { password, content, authors, allPolys, mode } = req.body;
 
     if (password !== process.env.SAVE_PASSWORD) {
         return res.status(401).send("Błędne hasło!");
     }
 
-    // Wybór pliku: 1 autor -> własny plik, wielu -> pozycje.js
+    // Wybór pliku
     let filename = 'poligons/pozycje.js';
     if (authors && authors.length === 1) {
         filename = `poligons/${authors[0].toLowerCase()}.js`;
     }
 
     try {
-        let existingContent = "";
         let sha = null;
-
         try {
             const { data: fileData } = await octokit.repos.getContent({
                 owner: process.env.REPO_OWNER,
@@ -50,45 +48,55 @@ app.post('/save', saveLimiter, async (req, res) => {
                 path: filename
             });
             sha = fileData.sha;
-            existingContent = Buffer.from(fileData.content, 'base64').toString('utf8');
-        } catch (e) {
-            // Plik nie istnieje - stworzymy nowy
-        }
+        } catch (e) {}
 
-        let updatedContent = existingContent.trim();
-        
-        if (!updatedContent.includes('window.registerPolygons')) {
-            // Nowy plik - tworzymy strukturę tablicy
-            updatedContent = `window.registerPolygons([\n${content}\n]);`;
+        let finalContent = "";
+
+        if (mode === "overwrite" && allPolys) {
+            // Generujemy pełny plik z tablicą wszystkich poligonów autora
+            const polysJson = allPolys.map(p => JSON.stringify(p, null, 2)).join(',\n');
+            finalContent = `window.registerPolygons([\n${polysJson}\n]);`;
         } else {
-            // SMART APPEND: Wstawianie DO ŚRODKA tablicy przed ]);
-            const lastIdx = updatedContent.lastIndexOf(']);');
-            if (lastIdx !== -1) {
-                let prefix = updatedContent.substring(0, lastIdx).trim();
-                // Jeśli przed zamknięciem nie ma przecinka ani otwarcia tablicy, dodajemy go
-                if (prefix.length > 0 && !prefix.endsWith(',') && !prefix.endsWith('[')) {
-                    prefix += ",";
-                }
-                updatedContent = prefix + `\n${content}\n]);`;
-            } else {
-                // Fallback jeśli plik ma inną strukturę
-                updatedContent += `\n\nwindow.registerPolygons([\n${content}\n]);`;
+            // Tryb APPEND (dla pozycje.js lub gdy brak allPolys)
+            let existingContent = "";
+            if (sha) {
+                const { data: fileData } = await octokit.repos.getContent({
+                    owner: process.env.REPO_OWNER,
+                    repo: process.env.REPO_NAME,
+                    path: filename
+                });
+                existingContent = Buffer.from(fileData.content, 'base64').toString('utf8');
             }
+
+            let updated = existingContent.trim();
+            if (!updated.includes('window.registerPolygons')) {
+                updated = `window.registerPolygons([\n${content}\n]);`;
+            } else {
+                const lastIdx = updated.lastIndexOf(']);');
+                if (lastIdx !== -1) {
+                    let prefix = updated.substring(0, lastIdx).trim();
+                    if (prefix.length > 0 && !prefix.endsWith(',') && !prefix.endsWith('[')) prefix += ",";
+                    updated = prefix + `\n${content}\n]);`;
+                } else {
+                    updated += `\n\nwindow.registerPolygons([\n${content}\n]);`;
+                }
+            }
+            finalContent = updated;
         }
 
         await octokit.repos.createOrUpdateFileContents({
             owner: process.env.REPO_OWNER,
             repo: process.env.REPO_NAME,
             path: filename,
-            message: `Aktualizacja mapy (${authors ? authors.join(', ') : 'admin'})`,
-            content: Buffer.from(updatedContent).toString('base64'),
+            message: `Aktualizacja: ${authors ? authors.join(', ') : 'admin'}`,
+            content: Buffer.from(finalContent).toString('base64'),
             sha: sha
         });
 
-        res.send(`Zapisano pomyślnie w ${filename}!`);
+        res.send(`Zapisano w ${filename}!`);
     } catch (e) {
         console.error("Błąd:", e.message);
-        res.status(500).send("Błąd serwera: " + e.message);
+        res.status(500).send("Błąd: " + e.message);
     }
 });
 
