@@ -6,9 +6,7 @@ require('dotenv').config();
 
 const app = express();
 
-console.log("--- URUCHOMIENIE BACKENDU (APPEND MODE) ---");
-console.log("Czy GITHUB_TOKEN jest wczytany?:", process.env.GITHUB_TOKEN ? "TAK" : "NIE");
-console.log("Repozytorium:", process.env.REPO_OWNER + "/" + process.env.REPO_NAME);
+console.log("--- BACKEND (SMART INTERNAL APPEND) ---");
 
 const saveLimiter = rateLimit({
     windowMs: 2000,
@@ -29,16 +27,15 @@ app.get('/status', (req, res) => {
 });
 
 app.post('/save', saveLimiter, async (req, res) => {
-    const { password, content, message, authors } = req.body;
+    const { password, content, authors } = req.body;
 
     if (password !== process.env.SAVE_PASSWORD) {
         return res.status(401).send("Błędne hasło!");
     }
 
-    // Decyzja o nazwie pliku
+    // Wybór pliku: 1 autor -> własny plik, wielu -> pozycje.js
     let filename = 'poligons/pozycje.js';
     if (authors && authors.length === 1) {
-        // Jeden autor -> własny plik (np. poligons/xrogo.js)
         filename = `poligons/${authors[0].toLowerCase()}.js`;
     }
 
@@ -55,29 +52,43 @@ app.post('/save', saveLimiter, async (req, res) => {
             sha = fileData.sha;
             existingContent = Buffer.from(fileData.content, 'base64').toString('utf8');
         } catch (e) {
-            // Plik nie istnieje - nie błąd, po prostu stworzymy nowy
+            // Plik nie istnieje - stworzymy nowy
         }
 
-        // DOPISYWANIE na końcu pliku
         let updatedContent = existingContent.trim();
-        if (updatedContent.length > 0) updatedContent += "\n\n";
         
-        // Dodajemy poligon jako nowe wywołanie funkcji
-        updatedContent += `window.registerPolygons([\n${content}\n]);`;
+        if (!updatedContent.includes('window.registerPolygons')) {
+            // Nowy plik - tworzymy strukturę tablicy
+            updatedContent = `window.registerPolygons([\n${content}\n]);`;
+        } else {
+            // SMART APPEND: Wstawianie DO ŚRODKA tablicy przed ]);
+            const lastIdx = updatedContent.lastIndexOf(']);');
+            if (lastIdx !== -1) {
+                let prefix = updatedContent.substring(0, lastIdx).trim();
+                // Jeśli przed zamknięciem nie ma przecinka ani otwarcia tablicy, dodajemy go
+                if (prefix.length > 0 && !prefix.endsWith(',') && !prefix.endsWith('[')) {
+                    prefix += ",";
+                }
+                updatedContent = prefix + `\n${content}\n]);`;
+            } else {
+                // Fallback jeśli plik ma inną strukturę
+                updatedContent += `\n\nwindow.registerPolygons([\n${content}\n]);`;
+            }
+        }
 
         await octokit.repos.createOrUpdateFileContents({
             owner: process.env.REPO_OWNER,
             repo: process.env.REPO_NAME,
             path: filename,
-            message: message || `Zmiana od ${authors ? authors.join(', ') : 'admina'}`,
+            message: `Aktualizacja mapy (${authors ? authors.join(', ') : 'admin'})`,
             content: Buffer.from(updatedContent).toString('base64'),
             sha: sha
         });
 
         res.send(`Zapisano pomyślnie w ${filename}!`);
     } catch (e) {
-        console.error("Błąd zapisu:", e.message);
-        res.status(500).send("Błąd podczas zapisu na GitHub: " + e.message);
+        console.error("Błąd:", e.message);
+        res.status(500).send("Błąd serwera: " + e.message);
     }
 });
 
