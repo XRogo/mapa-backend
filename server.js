@@ -6,10 +6,15 @@ require('dotenv').config();
 
 const app = express();
 
-// Konfiguracja Rate Limitu: max 1 prośba na 2 sekundy z jednego IP dla ścieżki /save
+// DEBUGOWANIE - Sprawdź to w zakładce "Logs" na Renderze!
+console.log("--- URUCHOMIENIE BACKENDU ---");
+console.log("Czy GITHUB_TOKEN jest wczytany?:", process.env.GITHUB_TOKEN ? "TAK (Długość: " + process.env.GITHUB_TOKEN.length + ")" : "NIE");
+console.log("Repozytorium:", process.env.REPO_OWNER + "/" + process.env.REPO_NAME);
+console.log("-----------------------------");
+
 const saveLimiter = rateLimit({
-    windowMs: 2000, // 2 sekundy
-    max: 1, // 1 zapytanie na okno
+    windowMs: 2000,
+    max: 1,
     message: "Zwolnij! Możesz wysyłać zmiany co 2 sekundy.",
     standardHeaders: true,
     legacyHeaders: false,
@@ -18,12 +23,17 @@ const saveLimiter = rateLimit({
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+const octokit = new Octokit({ 
+    auth: process.env.GITHUB_TOKEN,
+    userAgent: 'CraftlyMap-Backend v1.0'
+});
 
-// Status serwera
-app.get('/status', (req, res) => res.send({ status: 'ok' }));
+// Status serwera z nagłówkiem zakazującym cache
+app.get('/status', (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.send({ status: 'ok', time: new Date().toISOString() });
+});
 
-// Historia zmian (ostatnie 10 commitów pliku pozycje.js)
 app.get('/history', async (req, res) => {
     try {
         const { data } = await octokit.repos.listCommits({
@@ -42,7 +52,6 @@ app.get('/history', async (req, res) => {
     }
 });
 
-// Zapisywanie zmian (z nałożonym limitem 2s)
 app.post('/save', saveLimiter, async (req, res) => {
     const { password, content, message } = req.body;
 
@@ -51,28 +60,27 @@ app.post('/save', saveLimiter, async (req, res) => {
     }
 
     try {
-        // 1. Pobierz aktualny plik (potrzebujemy jego SHA do aktualizacji)
         const { data: fileData } = await octokit.repos.getContent({
             owner: process.env.REPO_OWNER,
             repo: process.env.REPO_NAME,
             path: 'pozycje.js'
         });
 
-        // 2. Wyślij nową treść pliku
         await octokit.repos.createOrUpdateFileContents({
             owner: process.env.REPO_OWNER,
             repo: process.env.REPO_NAME,
             path: 'pozycje.js',
-            message: message || "Aktualizacja mapy przez panel administratora",
+            message: message || "Aktualizacja mapy przez panel admina",
             content: Buffer.from(content).toString('base64'),
             sha: fileData.sha
         });
 
-        res.send("Zapisano pomyślnie! Zmiany będą widoczne na mapie za ok. 1-2 minuty.");
+        res.send("Zapisano pomyślnie na GitHub!");
     } catch (e) {
+        console.error("Błąd zapisu:", e.message);
         res.status(500).send("Błąd podczas zapisu na GitHub: " + e.message);
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Serwer backendu Crafty działa na porcie ${PORT}`));
+app.listen(PORT, () => console.log(`Serwer działa na porcie ${PORT}`));
