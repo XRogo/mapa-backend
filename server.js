@@ -42,8 +42,8 @@ app.post('/save-batch', saveLimiter, async (req, res) => {
 
     // Przetwarzamy każdy plik w paczce
     for (const item of batch) {
-        const { author, content } = item;
-        const filename = `poligons/${author.toLowerCase()}.js`;
+        const { author, content, path } = item;
+        const filename = path || `poligons/${author.toLowerCase()}.js`;
 
         try {
             let sha = null;
