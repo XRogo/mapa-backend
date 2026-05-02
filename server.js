@@ -26,6 +26,20 @@ app.get('/status', (req, res) => {
     res.send({ status: 'ok', time: new Date().toISOString() });
 });
 
+app.get('/get-render-list', async (req, res) => {
+    try {
+        const { data: fileData } = await octokit.repos.getContent({
+            owner: process.env.REPO_OWNER,
+            repo: process.env.REPO_NAME,
+            path: 'ktore_render.txt'
+        });
+        const content = Buffer.from(fileData.content, 'base64').toString('utf-8');
+        res.send(content);
+    } catch (e) {
+        res.status(404).send("Brak pliku");
+    }
+});
+
 app.post('/save-batch', saveLimiter, async (req, res) => {
     const { password, batch, message } = req.body;
 
