@@ -47,6 +47,32 @@ function compareHistoryFiles(left, right) {
     return aTime - bTime || Number(a[6] || 0) - Number(b[6] || 0) || left.localeCompare(right);
 }
 
+function formatHistoryValue(value, depth = 0) {
+    const indent = level => '  '.repeat(level);
+    if (Array.isArray(value)) {
+        const isFlatArray = value.every(item => item === null || typeof item !== 'object');
+        const isCoordinateArray = value.every(item =>
+            Array.isArray(item) && item.every(coordinate => coordinate === null || typeof coordinate !== 'object'));
+        if (isFlatArray || isCoordinateArray) {
+            if (isCoordinateArray) {
+                return `[${value.map(item => `[${item.map(coordinate => formatHistoryValue(coordinate, depth)).join(',')}]`).join(', ')}]`;
+            }
+            const separator = value.every(item => typeof item === 'number') ? ',' : ', ';
+            return `[${value.map(item => formatHistoryValue(item, depth)).join(separator)}]`;
+        }
+        if (value.length === 0) return '[]';
+        return `[\n${value.map(item => `${indent(depth + 1)}${formatHistoryValue(item, depth + 1)}`).join(',\n')}\n${indent(depth)}]`;
+    }
+    if (value && typeof value === 'object') {
+        const entries = Object.entries(value);
+        if (entries.length === 0) return '{}';
+        return `{\n${entries.map(([key, item]) =>
+            `${indent(depth + 1)}${JSON.stringify(key)}: ${formatHistoryValue(item, depth + 1)}`
+        ).join(',\n')}\n${indent(depth)}}`;
+    }
+    return JSON.stringify(value);
+}
+
 async function createUniqueHistoryPath(date) {
     const base = `poligons/${formatHistoryTimestamp(date)}`;
     let suffix = 1;
@@ -159,7 +185,7 @@ app.post('/save-batch', saveLimiter, async (req, res) => {
                     return res.status(409).send('Nie zapisano zmian: ktoś zapisał nowszą wersję. Twoje zmiany nadal są w tej karcie; sprawdź najnowszą mapę w drugim oknie przed ich ponownym wprowadzeniem.');
                 }
                 filename = await createUniqueHistoryPath(new Date());
-                fileContent = `window.applyPolygonChanges(${JSON.stringify(item.operations, null, 2)});\n`;
+                fileContent = `window.applyPolygonChanges(${formatHistoryValue(item.operations)});\n`;
             } else {
                 try {
                     const { data: fileData } = await octokit.repos.getContent({
