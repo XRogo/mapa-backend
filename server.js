@@ -21,9 +21,77 @@ app.use(express.json({ limit: '10mb' }));
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
+function formatHistoryTimestamp(date) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Warsaw',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23'
+    }).formatToParts(date).reduce((result, part) => {
+        if (part.type !== 'literal') result[part.type] = part.value;
+        return result;
+    }, {});
+    return `${parts.hour}.${parts.minute}.${parts.day}.${parts.month}.${parts.year}`;
+}
+
+function compareHistoryFiles(left, right) {
+    const pattern = /^(\d{2})\.(\d{2})\.(\d{2})\.(\d{2})\.(\d{4})(?:-(\d+))?\.js$/;
+    const a = pattern.exec(left);
+    const b = pattern.exec(right);
+    if (!a || !b) return left.localeCompare(right);
+    const aTime = Date.UTC(Number(a[5]), Number(a[4]) - 1, Number(a[3]), Number(a[1]), Number(a[2]));
+    const bTime = Date.UTC(Number(b[5]), Number(b[4]) - 1, Number(b[3]), Number(b[1]), Number(b[2]));
+    return aTime - bTime || Number(a[6] || 0) - Number(b[6] || 0) || left.localeCompare(right);
+}
+
+async function createUniqueHistoryPath(date) {
+    const base = `poligons/${formatHistoryTimestamp(date)}`;
+    let suffix = 1;
+    while (true) {
+        const filename = `${base}${suffix === 1 ? '' : `-${suffix}`}.js`;
+        try {
+            await octokit.repos.getContent({
+                owner: process.env.REPO_OWNER,
+                repo: process.env.REPO_NAME,
+                path: filename
+            });
+            suffix++;
+        } catch (error) {
+            if (error.status === 404) return filename;
+            throw error;
+        }
+    }
+}
+
+async function getPolygonHistoryFiles() {
+    const { data: files } = await octokit.repos.getContent({
+        owner: process.env.REPO_OWNER,
+        repo: process.env.REPO_NAME,
+        path: 'poligons'
+    });
+    if (!Array.isArray(files)) throw new Error('Nie udało się odczytać katalogu historii poligonów.');
+    return files
+        .filter(file => file.type === 'file' && /^\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{4}(?:-\d+)?\.js$/.test(file.name))
+        .map(file => file.name)
+        .sort(compareHistoryFiles);
+}
+
 app.get('/status', (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.send({ status: 'ok', time: new Date().toISOString() });
+});
+
+app.get('/polygon-history', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    try {
+        res.json(await getPolygonHistoryFiles());
+    } catch (error) {
+        console.error('Błąd pobierania historii poligonów:', error.message);
+        res.status(502).send('Nie udało się pobrać historii poligonów.');
+    }
 });
 
 app.get('/get-render-list', async (req, res) => {
@@ -47,29 +115,62 @@ app.post('/save-batch', saveLimiter, async (req, res) => {
         return res.status(401).send("Błędne hasło!");
     }
 
-    if (!batch || !Array.isArray(batch)) {
+    if (!batch || !Array.isArray(batch) || batch.length === 0) {
         return res.status(400).send("Brak danych w paczce (batch).");
+    }
+    if (batch.length > 2 || batch.some(item =>
+        !item || (item.type !== 'polygon-history' && item.path !== 'ktore_render.txt'))) {
+        return res.status(400).send("Dozwolony jest zapis historii poligonów oraz listy kafelków.");
     }
 
     const results = [];
     const errors = [];
 
-    // Przetwarzamy każdy plik w paczce
+    // Historyczne poligony są dopisywane pod nową nazwą; pozostałe pliki zachowują dotychczasowy zapis.
     for (const item of batch) {
         const { author, content, path } = item;
-        const filename = path || `poligons/${author.toLowerCase()}.js`;
+        let filename = path;
+        let fileContent = content;
 
         try {
             let sha = null;
-            try {
-                const { data: fileData } = await octokit.repos.getContent({
-                    owner: process.env.REPO_OWNER,
-                    repo: process.env.REPO_NAME,
-                    path: filename
-                });
-                sha = fileData.sha;
-            } catch (e) {
-                // Plik nie istnieje, sha pozostaje null
+            if (item.type === 'polygon-history') {
+                if (!Array.isArray(item.operations) || item.operations.length === 0) {
+                    throw new Error('Brak prawidłowych operacji historii poligonów.');
+                }
+                const createdIds = new Set();
+                for (const operation of item.operations) {
+                    if (!operation || typeof operation.id !== 'string' ||
+                        !['create', 'edit', 'delete'].includes(operation.type) ||
+                        (operation.type !== 'delete' &&
+                            (!operation.polygon || operation.polygon.id !== operation.id || typeof operation.polygon !== 'object'))) {
+                        throw new Error('Nieprawidłowa operacja historii poligonów.');
+                    }
+                    if (operation.type === 'create') {
+                        if (createdIds.has(operation.id)) throw new Error('Powtórzone ID nowego poligonu.');
+                        createdIds.add(operation.id);
+                    }
+                }
+                if (typeof item.baseVersion !== 'string') {
+                    throw new Error('Brak wersji bazowej historii.');
+                }
+                const historyFiles = await getPolygonHistoryFiles();
+                if (historyFiles[historyFiles.length - 1] !== item.baseVersion) {
+                    return res.status(409).send('Nie zapisano zmian: ktoś zapisał nowszą wersję. Twoje zmiany nadal są w tej karcie; sprawdź najnowszą mapę w drugim oknie przed ich ponownym wprowadzeniem.');
+                }
+                filename = await createUniqueHistoryPath(new Date());
+                fileContent = `window.applyPolygonChanges(${JSON.stringify(item.operations, null, 2)});\n`;
+            } else {
+                try {
+                    const { data: fileData } = await octokit.repos.getContent({
+                        owner: process.env.REPO_OWNER,
+                        repo: process.env.REPO_NAME,
+                        path: filename
+                    });
+                    sha = fileData.sha;
+                } catch (error) {
+                    if (error.status !== 404) throw error;
+                }
             }
 
             await octokit.repos.createOrUpdateFileContents({
@@ -77,7 +178,7 @@ app.post('/save-batch', saveLimiter, async (req, res) => {
                 repo: process.env.REPO_NAME,
                 path: filename,
                 message: message || `Zmiana zbiorcza: ${author}`,
-                content: Buffer.from(content).toString('base64'),
+                content: Buffer.from(fileContent).toString('base64'),
                 sha: sha
             });
             results.push(filename);
@@ -90,39 +191,18 @@ app.post('/save-batch', saveLimiter, async (req, res) => {
     if (errors.length > 0) {
         res.status(500).send(`Zapisano częściowo: ${results.join(', ')}. Błędy: ${errors.join('; ')}`);
     } else {
-        res.send(`Zaktualizowano pliki: ${results.join(', ')}`);
+        res.json({
+            files: results,
+            historyFile: results.find(filename => /^poligons\/\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{4}(?:-\d+)?\.js$/.test(filename)) || null
+        });
     }
 });
 
 // Stary endpoint dla kompatybilności (jeśli ktoś ma starą wersję strony)
 app.post('/save', saveLimiter, async (req, res) => {
-    const { password, content, authors } = req.body;
+    const { password } = req.body;
     if (password !== process.env.SAVE_PASSWORD) return res.status(401).send("Błędne hasło!");
-    
-    let filename = 'poligons/pozycje.js';
-    if (authors && authors.length === 1) filename = `poligons/${authors[0].toLowerCase()}.js`;
-
-    try {
-        let sha = null;
-        try {
-            const { data: fileData } = await octokit.repos.getContent({
-                owner: process.env.REPO_OWNER, repo: process.env.REPO_NAME, path: filename
-            });
-            sha = fileData.sha;
-        } catch (e) {}
-
-        await octokit.repos.createOrUpdateFileContents({
-            owner: process.env.REPO_OWNER,
-            repo: process.env.REPO_NAME,
-            path: filename,
-            message: "Aktualizacja (tryb stary)",
-            content: Buffer.from(content).toString('base64'),
-            sha: sha
-        });
-        res.send("Zapisano!");
-    } catch (e) {
-        res.status(500).send(e.message);
-    }
+    res.status(410).send("Ten format zapisu został wyłączony. Odśwież stronę, aby korzystać z historii wersji.");
 });
 
 const PORT = process.env.PORT || 3000;
